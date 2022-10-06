@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,8 @@ type Customer struct {
 }
 
 func main() {
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
 	var ShopLock chan bool
 	seats := make([]string, 5)
 	BarberShop := Shop{
@@ -30,11 +33,13 @@ func main() {
 		LockChan:     ShopLock,
 		BarberStatus: "awake",
 	}
+
 	Customers := makeCustomers()
+	log.Print("Starting...")
 
 	go BarberShop.OpenLockShop()
-
-	BarberShop.Run(Customers)
+	wg.Add(1)
+	BarberShop.Run(Customers, wg)
 
 }
 
@@ -51,6 +56,7 @@ func (S Shop) OpenLockShop() {
 func (S Shop) RunBarber() {
 	BarbTime := 10 //Barbing delay time
 	sleepCounter := 0
+
 	for {
 
 		if S.BarberStatus != "sleeping" {
@@ -86,10 +92,12 @@ func (S Shop) RunBarber() {
 		}
 		time.Sleep(time.Duration(rand.Intn(1e3)) * time.Millisecond)
 	}
+
 }
 
 //Run -
-func (S Shop) Run(C []Customer) {
+func (S Shop) Run(C []Customer, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for _, Cu := range C {
 
 		go func(Cu Customer) {
