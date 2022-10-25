@@ -1,271 +1,206 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
+	"strconv"
 	"time"
 )
 
-type Customer struct {
-	Number int
-	Name   string
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
-type Shop struct {
-	MaxSeats      int
-	FreeSeats     int
-	SeatCounter   chan int
-	LockStatus    bool //true means you can't read seat availability
-	CurrentLocker string
+type WaitRoom struct {
+	MaxSeats   int
+	UsedSeats  map[int]string
+	LockStatus string //open/closed
+	Keyholder  string
 }
 
-type OpenLocker struct {
-	Sendertype string
-	Name       string
-	LockChan   bool
+func (Wr *WaitRoom) Unlock(Keyholder string) bool {
+	if Wr.Keyholder == Keyholder {
+		Wr.LockStatus = "open"
+		Wr.Keyholder = ""
+		return true
+	}
+	return false
 }
 
-var Customers = make(chan Customer)
+func (Wr *WaitRoom) Lock(Keyholder string) bool {
+	if Wr.Keyholder == "" {
+		Wr.LockStatus = "closed"
+		Wr.Keyholder = Keyholder
+		return true
+	}
+	return false
+}
+
+func (Wr *WaitRoom) SeatStatus() map[int]string {
+	log.Printf("Waiting room seat status: %v\n", Wr.UsedSeats)
+	return Wr.UsedSeats
+}
+
+func (Wr *WaitRoom) TakeASeat(Cu Customer) bool {
+	CustomerID := <-Cu
+	CustomerIDString := strconv.Itoa(CustomerID)
+	if len(Wr.UsedSeats) < Wr.MaxSeats {
+		Wr.UsedSeats[CustomerID] = CustomerIDString
+		log.Printf("Waiting room seat taken by Customer -> %v\n", CustomerID)
+		_ = Wr.SeatStatus()
+		return true
+	}
+	return false
+}
+
+//TakeCustomerFromWr -
+func (Wr *WaitRoom) TakeCustomerFromWr(Brb *Barber, Cu Customer) bool {
+	Bd := len(Wr.UsedSeats)
+	delete(Wr.UsedSeats, <-Cu)
+
+	if len(Wr.UsedSeats) < Bd {
+		return true
+	}
+	return false
+}
+
+type Barber struct {
+	Status            string //sleeping/awake/checkingWR/barbing
+	PermittedStatuses map[string]string
+}
+
+//SetState - wake/sleep/checking/barbing
+func (Brb *Barber) SetStatus(state string) bool {
+	if v, ok := Brb.PermittedStatuses[state]; ok {
+		Brb.Status = v
+		return true
+	}
+	return false
+}
+
+//Sleep - Sets the Barber's state to sleeping
+func (Brb *Barber) Sleep() bool {
+	if Brb.Status != "barbing" && Brb.Status != "checkingWR" {
+		return Brb.SetStatus("sleeping")
+	}
+	return false
+}
+
+func (Brb *Barber) CheckWR() bool {
+	return false
+}
+
+type Shop chan WaitRoom
+
+func (S *Shop) Run() bool {
+
+	return false
+}
+
+func (S *Shop) FreeSeats() int {
+	// Sh := S
+
+	return 0
+}
+
+type Customer chan int
+
+func (Cu Customer) WalkIn(End chan bool, Brb *Barber, Wr *WaitRoom) {
+	for {
+		select {
+		case <-End:
+			fmt.Printf("End Signaled closing doors")
+			return
+		default:
+			CustomerID := <-Cu
+			fmt.Printf("New Customer at the door ID: %v\n", CustomerID)
+			for Tries := 1; ; Tries++ {
+				if Wr.LockStatus == "locked" && Wr.Keyholder == "barber" {
+					fmt.Printf("Waiting room is locked by barber try No: %v. I %v will try again\n", Tries, CustomerID)
+					continue
+				}
+
+				if Wr.LockStatus == "open" {
+					Wr.Lock("customer")
+					if Brb.Status == "sleeping" {
+						Brb.SetStatus("wake") //wake barber
+					}
+					//if seats are vacant, take a seat
+					if len(Wr.UsedSeats) < Wr.MaxSeats {
+						//take a seat
+						if !Wr.TakeASeat(Cu) {
+							log.Printf("Could not take waiting room seat... customer %v is leaving\n", CustomerID)
+						}
+						Wr.Unlock("customer")
+					} else {
+						//walk away
+						fmt.Printf("Waiting room is full try No: %v. I, %v will walk away now\n", Tries, CustomerID)
+						Wr.Unlock("customer")
+						time.Sleep(time.Millisecond * 2000)
+						continue
+					}
+				}
+			}
+		}
+	}
+}
+
+//NewCustomerGen - Generates new customers randomly conitnuously
+func NewCustomerGen(Ch chan<- int, End chan bool, limit int) int {
+	var TotalSent int = 0
+	if limit > 0 {
+		for i := 1; i < limit+1; i++ {
+			Ch <- i
+			TotalSent = TotalSent + 1
+			time.Sleep(time.Duration(rand.Intn(1e3)) * time.Millisecond)
+		}
+
+		fmt.Printf("No more customers, closing doors. sent total: %v\n", TotalSent)
+		close(Ch)
+		close(End)
+
+	} else {
+		for i := 1; ; i++ {
+			select {
+			case End <- true:
+				fmt.Println("Stop allowing more customers please closing doors")
+				close(Ch)
+				close(End)
+				return TotalSent
+
+			default:
+				Ch <- i
+				TotalSent = TotalSent + 1
+				time.Sleep(time.Duration(rand.Intn(1e3)) * time.Millisecond)
+			}
+		}
+	}
+	return TotalSent
+}
 
 func main() {
-	Sc := make(chan int)
-	go makeCustomers()
+	BarberStates := map[string]string{"sleeping": "sleeping", "awake": "awake", "checkingWR": "checkingWR", "barbing": "barbing"}
+	var Cu Customer = make(chan int)
+	var End = make(chan bool)
+	var limit int = 10 //limitless
 
-	S := Shop{
-		MaxSeats:    10,
-		FreeSeats:   10,
-		SeatCounter: Sc,
-		LockStatus:  true,
+	seats := make(map[int]string, 10)
+
+	Wr := WaitRoom{
+		MaxSeats:   10,
+		UsedSeats:  seats,
+		LockStatus: "open",
+		Keyholder:  "",
+	}
+	Brb := Barber{
+		Status:            "awake", //awake/checkingwr/barbing/sleeping
+		PermittedStatuses: BarberStates,
 	}
 
-	Ol := make(chan OpenLocker)
-	go RunShop(S, Ol)
-	go RunBarber(Ol)
-
-	for i := 0; ; i++ {
-		Olock := <-Ol
-		log.Printf("Gotten value from = %v Name: %v - - Free Seats : %v\n", Olock.Sendertype, Olock.Name, Olock.LockChan)
-
-		if Olock.LockChan == true && Olock.Sendertype == S.CurrentLocker {
-			S.LockStatus = Olock.LockChan
-			log.Printf("Just locked up the Shop WR : -- -%v\n", Olock.Sendertype)
-		} else {
-			//do nothing
-			log.Printf("Could not lock up the Shop WR : -- -%v\n", Olock.Sendertype)
-		}
-	}
+	go NewCustomerGen(Cu, End, limit)
+	go Cu.WalkIn(End, &Brb, &Wr)
+	// time.Sleep(time.Duration(rand.Intn(1e3)) * time.Second)
+	time.Sleep(15 * time.Second)
+	fmt.Println("Leaving...")
 }
-
-func RunBarber(Ol chan OpenLocker) {
-	//barbing delay +3
-	//awake waiting delay +2
-	//checkingwr delay +3
-
-	//barber status /awake/sleeping/checkingwr/barbing
-	for {
-		sender := "barber"
-		BName := "barberD"
-		Openl := OpenLocker{Sendertype: sender, Name: BName}
-		Openl.LockChan = true
-		Ol <- Openl
-		//awake
-		time.Sleep(2 * time.Second)
-
-		//check for shop lock status
-		//Change status to barbing
-
-		//Change status to sleeping
-		//Change status to checkingwr
-		//Change status to awake
-
-	}
-}
-
-func RunShop(S Shop, Ol chan OpenLocker) {
-	sender := "customer"
-	var C Customer
-
-	for i := 0; ; i++ {
-		C = <-Customers
-		if C.Number%2 == 0 {
-
-			OpenL := OpenLocker{Sendertype: sender, Name: C.Name}
-			OpenL.LockChan = false
-			Ol <- OpenL
-		} else {
-			OpenL := OpenLocker{Sendertype: sender, Name: C.Name}
-			OpenL.LockChan = true
-			Ol <- OpenL
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func makeCustomers() {
-	for i := 0; ; i++ {
-		Customers <- Customer{Number: i, Name: RandomCode(6)}
-	}
-}
-
-func RandomCode(length int) string {
-	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	code := make([]byte, length)
-	for i := range code {
-		code[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(code)
-}
-
-// package main
-
-// import (
-// 	"log"
-// 	"math/rand"
-// 	"sync"
-// 	"time"
-// )
-
-// type Shop struct {
-// 	WRSeats      []string  //maximum number of seats in waiting room
-// 	VacantSeats  int       //total free/vacant seats in waiting room
-// 	LockStatus   bool      //true means you can't read seat availability
-// 	LockChan     chan bool //LockChannel reads into LockStatus from Barber and Customers
-// 	BarberStatus string    //Barber status /sleeping/awake/barbing/checkingwr
-// 	// Customers    []Customer       //total customers in wr
-// }
-
-// type Customer struct {
-// 	Number int
-// 	Name   string
-// }
-
-// func main() {
-// 	var wg sync.WaitGroup
-
-// 	var ShopLock chan bool
-// 	seats := make([]string, 5)
-// 	BarberShop := Shop{
-// 		WRSeats:      seats,
-// 		VacantSeats:  5,
-// 		LockStatus:   false,
-// 		LockChan:     ShopLock,
-// 		BarberStatus: "awake",
-// 	}
-
-// 	Customers := makeCustomers()
-// 	log.Print("Starting...")
-
-// 	go RunBarber(BarberShop)
-// 	// go OpenLockShop(BarberShop)
-// 	wg.Add(1)
-// 	go Run(BarberShop, Customers, &wg)
-// 	go func() {
-// 		for i := 0; ; i++ {
-// 			f1 := <-BarberShop.LockChan
-// 			BarberShop.LockStatus = f1
-// 			log.Printf("Changing WR Lock Status from...%v", BarberShop.LockStatus)
-// 			time.Sleep(10 * time.Millisecond)
-// 		}
-
-// 	}()
-
-// 	time.Sleep(5 * time.Second)
-// 	log.Println("Leaving program....bored")
-// 	wg.Wait()
-// }
-
-// //Run -
-// func Run(S Shop, C []Customer, wg *sync.WaitGroup) {
-// 	log.Println("Starting Customer Run...")
-// 	defer wg.Done()
-// 	for _, Cu := range C {
-
-// 		go func(Cu Customer) {
-
-// 			if !S.LockStatus {
-// 				S.LockChan <- true
-// 				log.Printf("Customer...%v...LockWRStatus : %v", Cu.Name, S.LockStatus)
-// 				//Barber is not sleeping and
-// 				if S.VacantSeats > 0 && S.BarberStatus != "sleeping" {
-// 					S.WRSeats = append(S.WRSeats, Cu.Name)
-// 					S.VacantSeats--
-// 					S.LockChan <- false
-// 					log.Printf("Name is %v and I'm Taking a seat. %v seats are left", Cu.Name, S.VacantSeats)
-// 				}
-
-// 				//Barber is sleeping and there's empty seats- take a seat and - wake 'em up
-// 				if S.VacantSeats > 0 && S.BarberStatus == "sleeping" {
-// 					S.BarberStatus = "awake" //wake barber up
-// 					S.WRSeats = append(S.WRSeats, Cu.Name)
-// 					S.VacantSeats--
-// 					S.LockChan <- false
-// 					log.Printf("Name is %v and I'm Taking a seat. woke the barber up...oh and %v seats are left", Cu.Name, S.VacantSeats)
-// 				}
-
-// 				//Barber is not sleeping but seats are all occupied
-// 				if S.VacantSeats < 1 {
-// 					S.LockChan <- false
-// 					log.Printf("Name is %v and I'm walking off. %v seats are left", Cu.Name, S.VacantSeats)
-// 				}
-// 			}
-// 		}(Cu)
-// 	}
-// }
-
-// //OpenLockShop - Always receive the channel data, prevents it from blocking and empty it's pipe into LockStatus.
-// func OpenLockShop(S Shop) {
-// 	log.Println("Starting OpenLocker...")
-// 	for {
-// 		S.LockStatus = <-S.LockChan
-// 		log.Printf("Changing WR Lock Status from...%v", S.LockStatus)
-// 		time.Sleep(1000 * time.Millisecond)
-// 	}
-// }
-
-// func RunBarber(S Shop) {
-// 	S.LockChan <- true
-// 	log.Printf("Starting Barber...%v", S.BarberStatus)
-// 	log.Printf("Starting Barber...LOCKSTATUS %v", S.LockStatus)
-// 	BarbTime := 10 //Barbing delay time
-// 	sleepCounter := 0
-
-// 	for {
-
-// 		if S.BarberStatus != "sleeping" {
-// 			log.Printf("Starting Barber...%v --%v", S.BarberStatus, S.LockStatus)
-// 			sleepCounter = 0 //reset sleep counter after non-sleep event
-
-// 			if S.BarberStatus == "awake" && !S.LockStatus {
-// 				S.LockChan <- true //lock the waiting room
-// 				log.Printf("Starting Barber...%v --%v", S.BarberStatus, S.LockStatus)
-// 				S.BarberStatus = "checkingwr" //checking waiting room
-// 				if S.VacantSeats < len(S.WRSeats) {
-// 					client := S.WRSeats[len(S.WRSeats)-1]
-// 					S.WRSeats = S.WRSeats[:len(S.WRSeats)-1] //truncate
-// 					S.BarberStatus = "barbing"
-// 					log.Printf("Picked up a client. Name: %v. Going barbing", client)
-// 					S.LockChan <- false
-// 					//barbing delay
-// 					time.Sleep(time.Duration(BarbTime) * time.Millisecond) //barber is barbing
-// 					S.BarberStatus = "awake"                               //done barbing
-// 					log.Printf("Done barbing client. Name: %v.", client)
-// 				}
-// 			}
-
-// 			if S.BarberStatus == "awake" && S.LockStatus {
-// 				//Awake but waiting room is in use
-// 				time.Sleep(time.Duration(3) * time.Millisecond)
-// 			}
-
-// 		} else {
-// 			//sleeping
-// 			log.Println("Starting Barber...Sleeping")
-// 			//sest more if sleep try times increase
-// 			time.Sleep(time.Duration(sleepCounter) * time.Microsecond) //sleep more if sleep tries are more
-// 			sleepCounter++
-// 			continue
-// 		}
-// 		time.Sleep(time.Duration(rand.Intn(1e3)) * time.Millisecond)
-// 	}
-
-// }
